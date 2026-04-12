@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,44 @@ from mcp.types import Icon, ToolAnnotations
 if TYPE_CHECKING:
     from mcp.server.context import LifespanContextT, RequestT
     from mcp.server.mcpserver.context import Context
+
+
+def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline local $ref definitions in a JSON schema.
+
+    Pydantic's model_json_schema() may emit $ref/$defs for nested models.
+    Some LLM clients cannot resolve $ref, so we inline them here for
+    parity with the TypeScript SDK (modelcontextprotocol/typescript-sdk#1563).
+    """
+    defs = schema.get("$defs")
+    if not defs:
+        return schema
+
+    def _resolve(node: Any, visiting: frozenset[str] = frozenset()) -> Any:
+        if isinstance(node, list):
+            node_list = cast(list[Any], node)
+            return [_resolve(item, visiting) for item in node_list]
+        if not isinstance(node, dict):
+            return node
+        node_dict = cast(dict[str, Any], node)
+        ref_path = node_dict.get("$ref")
+        if ref_path is not None:
+            if not isinstance(ref_path, str) or not ref_path.startswith("#/$defs/"):
+                return node_dict
+            def_name: str = ref_path[len("#/$defs/") :]
+            if def_name in visiting:
+                return node_dict  # circular ref — leave as-is
+            if def_name not in defs:
+                return node_dict
+            resolved: dict[str, Any] = _resolve(copy.deepcopy(defs[def_name]), visiting | {def_name})
+            # Merge any sibling properties (e.g., description override)
+            siblings = {k: v for k, v in node_dict.items() if k != "$ref"}
+            return {**resolved, **siblings}
+        return {k: _resolve(v, visiting) for k, v in node_dict.items()}
+
+    result = _resolve(schema)
+    result.pop("$defs", None)
+    return result
 
 
 class Tool(BaseModel):
@@ -72,7 +111,7 @@ class Tool(BaseModel):
             skip_names=[context_kwarg] if context_kwarg is not None else [],
             structured_output=structured_output,
         )
-        parameters = func_arg_metadata.arg_model.model_json_schema(by_alias=True)
+        parameters = _dereference_schema(func_arg_metadata.arg_model.model_json_schema(by_alias=True))
 
         return cls(
             fn=fn,
